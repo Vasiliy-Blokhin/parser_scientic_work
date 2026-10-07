@@ -1,18 +1,25 @@
 """
 Парсер научных статей с CyberLeninka.
 
-Версия 4 — непрерывный режим:
-  1. Только пул ключевых слов (без интерактивного режима)
-  2. Непрерывное скачивание, остановка только по Ctrl+C
-  3. Случайная задержка 10–50 секунд между запросами
-  4. Динамическое обновление данных из БД в начале каждого цикла
-  5. Блоки по 10 документов
+Рефакторинг по ТЗ (версия 2):
+  1. Контроль дубликатов на начальном этапе (MD5) + спецификации
+  2. Извлечение информации на этапе парсинга + спецификация документа
+  3. Формирование директорий с блоками по 10 документов
+  4. Пул ключевых слов с приоритетами (техническая литература — первой)
+  5. Спецификации для подключения к различным сайтам и сервисам
+  6. Разделение main на этапы с логированием и комментариями
+
+Обновление (версия 3):
+  7. Сохранение информации о скачанных файлах в SQLite-БД
+  8. Предварительная проверка дубликатов через БД (отсекает до скачивания)
+  9. Спецификации хранятся рядом с PDF-файлами в блочных директориях
+  10. Циклический поиск по пулу ключевых слов (блоками по 10 документов)
+  11. Работа до остановки пользователем или достижения 1 ГБ суммарного веса
 """
 
 import hashlib
 import json
 import logging
-import random
 import re
 import time
 import urllib.parse
@@ -36,7 +43,6 @@ from modules.settings import (
     USE_CACHE, CACHE_DIR, PDF_DIR, DOWNLOAD_PDF, PDF_RETRIES,
     SKIP_EXISTING_PDFS, SEARCH_DELAY, ARTICLE_DELAY, MIN_SCORE,
     MAX_ABSTRACT_LENGTH, MIN_SCORE_ONE_WORD,
-    MIN_REQUEST_DELAY, MAX_REQUEST_DELAY,
 )
 from modules.values import SHORT_ABBREVIATIONS, STOP_WORDS
 from modules.keyword_pool import get_keywords_by_priority, get_keyword_groups
@@ -45,6 +51,14 @@ from modules.site_specs import get_default_site, get_site_spec
 # Обновлённые модули (с интеграцией БД)
 from modules.db_manager import DatabaseManager
 from modules.spec_manager import SpecManager
+
+
+# ──────────────────────────────────────────────────────────────
+#  Константы
+# ──────────────────────────────────────────────────────────────
+
+# Лимит суммарного веса скачанных файлов (1 ГБ в байтах)
+MAX_TOTAL_SIZE_BYTES = 1 * 1024 * 1024 * 1024
 
 
 # ──────────────────────────────────────────────────────────────
@@ -77,11 +91,13 @@ logger.addHandler(_file)
 
 class Parser:
     """
-    Парсер научных статей (непрерывный режим).
+    Парсер научных статей.
 
     Использование:
         parser = Parser()
-        parser()
+        parser()                      # интерактивный режим
+        parser(use_pool=True)         # режим с пулом ключевых слов (без лимита, до 1 ГБ)
+        parser(use_pool=True, max_results=50)  # режим пула с лимитом по количеству
     """
 
     def __init__(self):
@@ -103,10 +119,9 @@ class Parser:
         self.site_spec = get_default_site()
         self._block_number = None
 
-        # Счётчики
+        # Счётчики для циклического режима
         self._total_downloaded_size = 0
         self._total_articles = 0
-        self._articles = []
 
     # ════════════════════════════════════════════════════════════
     #  TOC: __call__ — точка входа
@@ -114,21 +129,19 @@ class Parser:
 
     def __call__(self, *args, **kwargs):
         """
-        Точка входа. Непрерывный режим — только пул ключевых слов.
-        Остановка только по Ctrl+C.
+        Точка входа. Разделена на этапы с логированием.
         """
-        logger.info("=" * 60)
-        logger.info("ЗАПУСК ПАРСЕРА (v4 — непрерывный режим)")
-        logger.info("Задержка между запросами: %d–%d сек",
-                    MIN_REQUEST_DELAY, MAX_REQUEST_DELAY)
-        logger.info("Размер блока: 10 документов")
-        logger.info("=" * 60)
+        use_pool = kwargs.get("use_pool", False)
+        max_results = kwargs.get("max_results", None)  # None = без лимита (до 1 ГБ)
 
         # ── Этап 1: Подготовка ──
+        logger.info("=" * 60)
+        logger.info("ЗАПУСК ПАРСЕРА (v3 — БД + циклический режим)")
+        logger.info("=" * 60)
         self._stage_prepare()
 
-        # ── Этап 2: Настройки ──
-        settings = self._stage_settings()
+        # ── Этап 2: Сбор настроек ──
+        settings = self._stage_settings(use_pool=use_pool, max_results=max_results)
 
         # ── Этап 3: Запуск браузера ──
         browser_ctx = self._stage_browser_start()
@@ -136,21 +149,22 @@ class Parser:
             logger.error("Не удалось запустить браузер. Остановка.")
             return
 
-        # ── Этап 4: Парсинг (бесконечный цикл) ──
+        # ── Этап 4: Парсинг ──
         try:
-            self._stage_parse(settings, browser_ctx)
-        except KeyboardInterrupt:
-            logger.info("Остановлено пользователем.")
-        except Exception as e:
-            logger.error("КРИТИЧЕСКАЯ ОШИБКА: %s", repr(e))
-        finally:
+            articles = self._stage_parse(settings, browser_ctx)
+
             # ── Этап 5: Сохранение результатов ──
-            if self._articles:
-                self._stage_save(self._articles, settings)
+            self._stage_save(articles, settings)
 
             # ── Этап 6: Статистика ──
             self._stage_stats()
 
+        except KeyboardInterrupt:
+            logger.info("Остановлено пользователем.")
+            self._stage_stats()
+        except Exception as e:
+            logger.error("КРИТИЧЕСКАЯ ОШИБКА: %s", repr(e))
+        finally:
             # ── Этап 7: Завершение ──
             self._stage_browser_stop(browser_ctx)
             self.db_manager.close()
@@ -186,34 +200,124 @@ class Parser:
         logger.info("Текущий блок директорий: %d", self._block_number)
 
     # ════════════════════════════════════════════════════════════
-    #  ЭТАП 2: Настройки (только пул ключевых слов)
+    #  ЭТАП 2: Настройки
     # ════════════════════════════════════════════════════════════
 
-    def _stage_settings(self):
-        """Сбор настроек поиска — только пул ключевых слов."""
-        logger.info("Этап 2: Настройки поиска (режим пула ключевых слов)")
+    def _stage_settings(self, use_pool=False, max_results=None):
+        """Сбор настроек поиска."""
+        logger.info("Этап 2: Настройки поиска")
 
-        keywords = get_keywords_by_priority()
-        logger.info("Пул ключевых слов (%d шт.): %s",
-                    len(keywords), keywords[:5])
+        if use_pool:
+            keywords = get_keywords_by_priority()
+            logger.info("Пул ключевых слов (%d шт.): %s",
+                        len(keywords), keywords[:5])
 
-        settings = {
-            "queries": keywords,
-            "start_year": 2020,
-            "end_year": 2026,
-            "max_pages": 5,
-            "filters": [],
-            "filter_mode": "any",
-            "download_pdf": True,
-        }
+            settings = {
+                "queries": keywords,
+                "start_year": 2020,
+                "end_year": 2026,
+                "max_results": max_results,  # None = без лимита
+                "max_pages": 5,
+                "filters": [],
+                "filter_mode": "any",
+                "download_pdf": True,
+                "max_total_size": MAX_TOTAL_SIZE_BYTES,
+            }
+            if max_results is None:
+                logger.info(
+                    "Режим пула: %d запросов, без лимита статей, лимит %.0f GB",
+                    len(settings["queries"]),
+                    settings["max_total_size"] / (1024**3),
+                )
+            else:
+                logger.info(
+                    "Режим пула: %d запросов, лимит статей %d, лимит %.0f GB",
+                    len(settings["queries"]),
+                    max_results,
+                    settings["max_total_size"] / (1024**3),
+                )
+        else:
+            settings = self._get_settings_interactive()
+            settings["max_total_size"] = MAX_TOTAL_SIZE_BYTES
+
         logger.info(
-            "Настройки: запросов=%d, годы=%d-%d, PDF=%s",
+            "Настройки: запросов=%d, годы=%d-%d, лимит=%s, PDF=%s, размер-лимит=%.2f GB",
             len(settings["queries"]),
             settings["start_year"],
             settings["end_year"],
+            settings["max_results"],
             settings["download_pdf"],
+            settings["max_total_size"] / (1024**3),
         )
         return settings
+
+    @staticmethod
+    def _get_settings_interactive():
+        """Интерактивный ввод настроек."""
+        print()
+        print("=" * 70)
+        print("НАСТРОЙКИ ПОИСКА")
+        print("=" * 70)
+        print()
+        print("Введите поисковые слова или фразы.")
+        print("Можно использовать ',' или ';' как разделитель.")
+        print()
+        print("Пример:")
+        print("ИИ, искусственный интеллект, RAG, машинное обучение")
+
+        query = input("Поиск: ").strip()
+
+        queries = [
+            x.strip()
+            for x in re.split(r"[;,]", query)
+            if x.strip()
+        ]
+
+        if not queries:
+            queries = ["нейросети"]
+
+        start_year = int(input("Начальный год [2024]: ") or 2024)
+        end_year = int(input("Конечный год [2026]: ") or 2026)
+
+        max_results_input = input("Максимум статей [пусто = без лимита, до 1 ГБ]: ").strip()
+        max_results = int(max_results_input) if max_results_input else None
+
+        max_pages = int(input("Максимум страниц на запрос [5]: ") or 5)
+
+        print()
+        print("Дополнительный фильтр. Можно оставить пустым.")
+        print("Разделители: ',' или ';'")
+
+        filter_text = input("Фильтр: ").strip()
+        filters = [
+            x.strip()
+            for x in re.split(r"[;,]", filter_text)
+            if x.strip()
+        ]
+
+        filter_mode = "any"
+        if filters:
+            print()
+            print("1 — достаточно любого")
+            print("2 — нужны все")
+            if input("Режим [1]: ").strip() == "2":
+                filter_mode = "all"
+
+        print()
+        download_pdf_flag = (
+            input("Скачивать статьи в PDF? [Y/n]: ").strip().lower() != "n"
+        )
+
+        return {
+            "queries": queries,
+            "start_year": start_year,
+            "end_year": end_year,
+            "max_results": max_results,
+            "max_pages": max_pages,
+            "filters": filters,
+            "filter_mode": filter_mode,
+            "download_pdf": download_pdf_flag,
+        }
 
     # ════════════════════════════════════════════════════════════
     #  ЭТАП 3: Запуск браузера
@@ -240,12 +344,6 @@ class Parser:
             if USE_PROXY:
                 options["proxy"] = {"server": PROXY}
 
-            # Stealth: отключаем признак автоматизации
-            if BROWSER == "chromium":
-                options["args"] = [
-                    "--disable-blink-features=AutomationControlled",
-                ]
-
             try:
                 browser = engine.launch(**options)
             except Exception as e:
@@ -262,20 +360,9 @@ class Parser:
                 locale="ru-RU",
                 viewport={"width": 1400, "height": 900},
                 accept_downloads=True,
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
                 extra_http_headers={
                     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"
                 },
-            )
-
-            # Скрываем navigator.webdriver
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', "
-                "{get: () => undefined})"
             )
 
             page = context.new_page()
@@ -318,27 +405,19 @@ class Parser:
         logger.info("Работа завершена.")
 
     # ════════════════════════════════════════════════════════════
-    #  ЭТАП 4: Парсинг — непрерывный цикл
+    #  ЭТАП 4: Парсинг — основной цикл (циклический режим)
     # ════════════════════════════════════════════════════════════
-
-    def _random_delay(self):
-        """Случайная задержка между запросами (10–50 сек)."""
-        delay = random.uniform(MIN_REQUEST_DELAY, MAX_REQUEST_DELAY)
-        logger.info("Задержка: %.1f сек", delay)
-        time.sleep(delay)
 
     def _stage_parse(self, settings, browser_ctx):
         """
-        Непрерывный цикл парсинга.
+        Основной цикл парсинга (циклический режим).
 
         Проходит по пулу ключевых слов циклически, постранично.
         Каждый цикл: для каждого ключевого слова — по 1 странице.
-        Работает бесконечно, остановка только по Ctrl+C.
-
-        В начале каждого цикла — динамическое обновление данных из БД.
-        Между запросами — случайная задержка 10–50 секунд.
+        Продолжает, пока не достигнут лимит (1 ГБ или max_results)
+        или пользователь не остановит (Ctrl+C).
         """
-        logger.info("Этап 4: Непрерывный парсинг")
+        logger.info("Этап 4: Парсинг (циклический режим)")
 
         _, _, _, page = browser_ctx
 
@@ -358,34 +437,59 @@ class Parser:
 
         logger.info("%s доступен: статус %d", site["name"], response.status)
 
+        articles = []
+        seen_urls = set()
+
+        # Загружаем URL, уже записанные в БД, чтобы не дублировать
+        db_urls = self.db_manager.get_known_urls()
+        seen_urls.update(db_urls)
+        logger.info("URL из БД: %d (исключаются из поиска)", len(db_urls))
+
         queries = settings["queries"]
         max_pages = settings["max_pages"]
+        max_results = settings["max_results"]
+        max_total_size = settings["max_total_size"]
 
+        # ── Циклический проход по пулу ключевых слов ──
         cycle_number = 0
+        no_new_articles_cycles = 0
+        MAX_IDLE_CYCLES = 3  # если 3 цикла подряд нет новых статей — стоп
 
         while True:
-            # ── Динамическое обновление данных из БД ──
-            seen_urls = self.db_manager.get_known_urls()
-            self._total_downloaded_size = self.db_manager.get_total_size()
-            self._total_articles = self.db_manager.get_downloaded_count()
+            # Проверка лимитов
+            if max_results is not None and len(articles) >= max_results:
+                logger.info("Достигнут лимит по количеству: %d статей", max_results)
+                break
+
+            if self._total_downloaded_size >= max_total_size:
+                logger.info(
+                    "Достигнут лимит по размеру: %.2f GB",
+                    self._total_downloaded_size / (1024**3),
+                )
+                break
 
             cycle_number += 1
             new_this_cycle = 0
-
             logger.info("=" * 50)
-            logger.info("ЦИКЛ %d | Скачано: %d | Размер: %.2f MB | URL в БД: %d",
-                        cycle_number,
-                        self._total_articles,
-                        self._total_downloaded_size / (1024 * 1024),
-                        len(seen_urls))
+            logger.info("ЦИКЛ %d | Статей: %d | Размер: %.2f MB / %.2f GB",
+                        cycle_number, len(articles),
+                        self._total_downloaded_size / (1024**2),
+                        max_total_size / (1024**3))
             logger.info("=" * 50)
 
             for query in queries:
+                # Проверка лимитов внутри цикла
+                if max_results is not None and len(articles) >= max_results:
+                    break
+                if self._total_downloaded_size >= max_total_size:
+                    break
+
                 logger.info("─" * 40)
                 logger.info("Ключевое слово: %s", query)
                 logger.info("─" * 40)
 
-                # Номер страницы = cycle_number (зацикливается по max_pages)
+                # Для каждого ключевого слова — по одной странице за цикл
+                # Номер страницы = cycle_number (ограничено max_pages)
                 page_number = cycle_number
                 if page_number > max_pages:
                     page_number = ((cycle_number - 1) % max_pages) + 1
@@ -396,68 +500,65 @@ class Parser:
                 html = self.get_html(page, search_url)
                 if not html:
                     logger.warning("Поиск не загружен, пропуск")
-                    self._random_delay()
                     continue
 
                 links = self.search_links(html)
                 logger.info("Ссылок найдено: %d", len(links))
 
                 for article_url in links:
+                    # Проверка лимитов
+                    if max_results is not None and len(articles) >= max_results:
+                        break
+                    if self._total_downloaded_size >= max_total_size:
+                        break
+
                     # ── Предварительная проверка через БД ──
-                    is_dup, existing = (
-                        self.db_manager.check_duplicate_before_download(
-                            article_url
-                        )
-                    )
+                    is_dup, existing = self.db_manager.check_duplicate_before_download(article_url)
                     if is_dup:
-                        logger.info(
-                            "✗ Дубликат по URL в БД, пропуск: %s",
-                            article_url,
-                        )
+                        logger.info("✗ Дубликат по URL в БД, пропуск: %s", article_url)
                         continue
 
                     if article_url in seen_urls:
                         continue
                     seen_urls.add(article_url)
 
-                    logger.info("Кандидат: %s", article_url)
+                    logger.info("Кандидат #%d: %s", len(seen_urls), article_url)
 
                     article = self._process_article(
                         page, article_url, query, settings
                     )
 
                     if article:
-                        self._articles.append(article)
+                        articles.append(article)
                         new_this_cycle += 1
                         logger.info(
-                            "✓ Статья #%d. Размер: %.2f MB",
-                            len(self._articles),
-                            self._total_downloaded_size / (1024 * 1024),
+                            "✓ Статья #%d. Размер: %.2f MB / %.2f GB",
+                            len(articles),
+                            self._total_downloaded_size / (1024**2),
+                            max_total_size / (1024**3),
                         )
+                        time.sleep(ARTICLE_DELAY)
 
-                    # Случайная задержка между статьями
-                    self._random_delay()
+                time.sleep(SEARCH_DELAY)
 
-                # Случайная задержка между ключевыми словами
-                self._random_delay()
-
-            # ── Сохранение Excel накопительно каждый цикл ──
-            if self._articles:
-                logger.info("Сохранение Excel (накопительно)...")
-                self.save_excel(
-                    self._articles,
-                    settings["queries"],
-                    settings["start_year"],
-                    settings["end_year"],
+            # Проверка: были ли новые статьи в этом цикле
+            if new_this_cycle == 0:
+                no_new_articles_cycles += 1
+                logger.warning(
+                    "Цикл %d: новых статей нет (%d/%d)",
+                    cycle_number, no_new_articles_cycles, MAX_IDLE_CYCLES,
                 )
+                if no_new_articles_cycles >= MAX_IDLE_CYCLES:
+                    logger.info(
+                        "Прекращение: %d циклов без новых статей.",
+                        MAX_IDLE_CYCLES,
+                    )
+                    break
+            else:
+                no_new_articles_cycles = 0
 
-            logger.info(
-                "Цикл %d завершён. Новых статей: %d. Всего: %d",
-                cycle_number, new_this_cycle, len(self._articles),
-            )
-
-            # Случайная задержка между циклами
-            self._random_delay()
+        logger.info("Парсинг завершён. Найдено статей: %d", len(articles))
+        return articles
 
     def _build_search_url(self, query, page_number):
         """Формирует URL поиска по спецификации сайта."""
@@ -727,16 +828,14 @@ class Parser:
         if kw_stats:
             logger.info("── По ключевым словам ──")
             for s in kw_stats[:10]:
-                logger.info("  %s: %d файлов, %.2f MB",
-                            s["keyword"], s["count"], s["size_mb"])
+                logger.info("  %s: %d файлов, %.2f MB", s["keyword"], s["count"], s["size_mb"])
 
         # Статистика по блокам
         block_stats = self.db_manager.get_stats_by_block()
         if block_stats:
             logger.info("── По блокам ──")
             for s in block_stats:
-                logger.info("  block_%03d: %d файлов, %.2f MB",
-                            s["block"], s["count"], s["size_mb"])
+                logger.info("  block_%03d: %d файлов, %.2f MB", s["block"], s["count"], s["size_mb"])
 
         # Статистика из spec_manager
         spec_stats = self.spec_manager.get_stats()
@@ -761,6 +860,33 @@ class Parser:
         PDF_DIR.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
+    def normalize(text):
+        """Нормализация текста."""
+        text = str(text or "").lower()
+        text = text.replace("ё", "е")
+        text = re.sub(r"[^а-яa-z0-9\s-]", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def words(self, text):
+        """Получает список лемм."""
+        result = []
+        for original in str(text or "").split():
+            original = original.strip()
+            if not original:
+                continue
+            normalized = self.normalize(original)
+            if not normalized:
+                continue
+            is_abbreviation = (normalized in SHORT_ABBREVIATIONS)
+            if len(normalized) < 3 and not is_abbreviation:
+                continue
+            if normalized in STOP_WORDS:
+                continue
+            if normalized not in result:
+                result.append(normalized)
+        return result
+
+    @staticmethod
     def cache_file(url):
         """Один HTML-файл на URL."""
         filename = hashlib.sha1(url.encode("utf-8")).hexdigest() + ".html"
@@ -769,9 +895,6 @@ class Parser:
     def get_cached(self, url):
         """Читает HTML из кэша."""
         if not USE_CACHE:
-            return None
-        # Не кэшируем поисковые страницы — они могут меняться
-        if "/search" in url:
             return None
         path = self.cache_file(url)
         if not path.exists():
@@ -788,9 +911,6 @@ class Parser:
     def save_cached(self, url, html):
         """Сохраняет HTML в кэш."""
         if not USE_CACHE or not html:
-            return
-        # Не кэшируем поисковые страницы
-        if "/search" in url:
             return
         try:
             self.cache_file(url).write_text(html, encoding="utf-8")
@@ -841,7 +961,8 @@ class Parser:
             if not html:
                 return None
 
-            self.save_cached(url, html)
+            if "/search" not in url or "/article/" in html:
+                self.save_cached(url, html)
 
             logger.debug("HTML: %d bytes", len(html.encode("utf-8")))
             return html
@@ -1036,9 +1157,6 @@ class Parser:
             coverage = len(found) / len(query_words)
             if coverage == 1:
                 score += 15
-                value = "title:phrase"
-                if value not in matches:
-                    matches.insert(0, value)
             elif coverage >= 0.75:
                 score += 8
 
@@ -1069,33 +1187,6 @@ class Parser:
         return any(checks)
 
     @staticmethod
-    def normalize(text):
-        """Нормализация текста."""
-        text = str(text or "").lower()
-        text = text.replace("ё", "е")
-        text = re.sub(r"[^а-яa-z0-9\s-]", " ", text)
-        return re.sub(r"\s+", " ", text).strip()
-
-    def words(self, text):
-        """Получает список лемм."""
-        result = []
-        for original in str(text or "").split():
-            original = original.strip()
-            if not original:
-                continue
-            normalized = self.normalize(original)
-            if not normalized:
-                continue
-            is_abbreviation = (normalized in SHORT_ABBREVIATIONS)
-            if len(normalized) < 3 and not is_abbreviation:
-                continue
-            if normalized in STOP_WORDS:
-                continue
-            if normalized not in result:
-                result.append(normalized)
-        return result
-
-    @staticmethod
     def safe_pdf_name(title, year, article_url):
         """Безопасное имя PDF-файла."""
         title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title)
@@ -1122,8 +1213,7 @@ class Parser:
             return str(path), "already_exists", pdf_url
 
         for attempt in range(1, PDF_RETRIES + 1):
-            logger.info("Скачивание PDF (попытка %d/%d): %s",
-                        attempt, PDF_RETRIES, pdf_url)
+            logger.info("PDF попытка %d/%d: %s", attempt, PDF_RETRIES, pdf_url)
             pdf_page = None
 
             try:
@@ -1154,8 +1244,7 @@ class Parser:
                 return str(path), "downloaded", pdf_url
 
             except Exception as e:
-                logger.warning("Ошибка скачивания (попытка %d): %s",
-                               attempt, repr(e))
+                logger.warning("PDF ошибка (попытка %d): %s", attempt, repr(e))
                 if attempt < PDF_RETRIES:
                     time.sleep(attempt * 2)
             finally:
@@ -1248,4 +1337,12 @@ class Parser:
 
 if __name__ == "__main__":
     parser = Parser()
-    parser()
+
+    # Интерактивный режим:
+    # parser()
+
+    # Режим с пулом ключевых слов (работает до 1 ГБ или Ctrl+C):
+    parser(use_pool=True)
+
+    # Режим с пулом и лимитом по количеству:
+    # parser(use_pool=True, max_results=50)
