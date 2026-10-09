@@ -6,7 +6,9 @@
   2. Непрерывное скачивание, остановка только по Ctrl+C
   3. Случайная задержка 10–50 секунд между запросами
   4. Динамическое обновление данных из БД в начале каждого цикла
-  5. Блоки по 10 документов
+  5. Категории → блоки по 10 документов
+  6. Пул исключений, фильтр по годам (2024–2026)
+  7. Быстрый перезапуск: обработанные URL и прогресс хранятся в БД
 """
 
 import hashlib
@@ -37,9 +39,14 @@ from modules.settings import (
     SKIP_EXISTING_PDFS, SEARCH_DELAY, ARTICLE_DELAY, MIN_SCORE,
     MAX_ABSTRACT_LENGTH, MIN_SCORE_ONE_WORD,
     MIN_REQUEST_DELAY, MAX_REQUEST_DELAY,
+    START_YEAR, END_YEAR, MAX_PAGES, FILTERS, FILTER_MODE,
+    USE_EXCLUSIONS, EXCLUSION_MIN_ABSTRACT_HITS, DOCS_PER_BLOCK,
 )
 from modules.values import SHORT_ABBREVIATIONS, STOP_WORDS
-from modules.keyword_pool import get_keywords_by_priority, get_keyword_groups
+from modules.keyword_pool import (
+    get_keywords_by_priority, get_keyword_groups, get_query_category_map,
+)
+from modules.exclusion_pool import get_all_exclusion_phrases
 from modules.site_specs import get_default_site, get_site_spec
 
 # Обновлённые модули (с интеграцией БД)
@@ -101,7 +108,13 @@ class Parser:
         self.spec_manager = SpecManager(db_manager=self.db_manager)
 
         self.site_spec = get_default_site()
-        self._block_number = None
+
+        # Категория по ключевому слову + фразы исключений
+        self.query_category = get_query_category_map()
+        self.exclusion_patterns = self._build_exclusion_patterns()
+
+        # Был ли реальный сетевой запрос (для умной задержки)
+        self._network_used = False
 
         # Счётчики
         self._total_downloaded_size = 0
@@ -181,9 +194,10 @@ class Parser:
             self._total_downloaded_size / (1024 * 1024 * 1024),
         )
 
-        # Текущий блок
-        self._block_number = self.spec_manager.current_block
-        logger.info("Текущий блок директорий: %d", self._block_number)
+        logger.info(
+            "Обработано URL (скачано + отклонено): %d",
+            len(self.db_manager.get_processed_urls()),
+        )
 
     # ════════════════════════════════════════════════════════════
     #  ЭТАП 2: Настройки (только пул ключевых слов)
@@ -199,11 +213,11 @@ class Parser:
 
         settings = {
             "queries": keywords,
-            "start_year": 2020,
-            "end_year": 2026,
-            "max_pages": 5,
-            "filters": [],
-            "filter_mode": "any",
+            "start_year": START_YEAR,
+            "end_year": END_YEAR,
+            "max_pages": MAX_PAGES,
+            "filters": FILTERS,
+            "filter_mode": FILTER_MODE,
             "download_pdf": True,
         }
         logger.info(
@@ -361,102 +375,102 @@ class Parser:
         queries = settings["queries"]
         max_pages = settings["max_pages"]
 
-        cycle_number = 0
+        # ── Восстановление прогресса прошлого запуска ──
+        cycle_number = self.db_manager.get_state("cycle", 0) or 1
+        done_queries = set(self.db_manager.get_state("done_queries", []))
+        if cycle_number > 1 or done_queries:
+            logger.info(
+                "Возобновление: цикл %d, уже пройдено запросов: %d",
+                cycle_number, len(done_queries),
+            )
 
         while True:
             # ── Динамическое обновление данных из БД ──
-            seen_urls = self.db_manager.get_known_urls()
+            # processed = скачанные + отклонённые (год, релевантность,
+            # исключения, дубликаты). Их повторно не открываем.
+            processed = self.db_manager.get_processed_urls()
             self._total_downloaded_size = self.db_manager.get_total_size()
             self._total_articles = self.db_manager.get_downloaded_count()
-
-            cycle_number += 1
             new_this_cycle = 0
 
+            self.db_manager.set_state("cycle", cycle_number)
+
             logger.info("=" * 50)
-            logger.info("ЦИКЛ %d | Скачано: %d | Размер: %.2f MB | URL в БД: %d",
+            logger.info("ЦИКЛ %d | Скачано: %d | Размер: %.2f MB | Обработано URL: %d",
                         cycle_number,
                         self._total_articles,
                         self._total_downloaded_size / (1024 * 1024),
-                        len(seen_urls))
+                        len(processed))
             logger.info("=" * 50)
 
-            for query in queries:
-                logger.info("─" * 40)
-                logger.info("Ключевое слово: %s", query)
-                logger.info("─" * 40)
+            page_number = ((cycle_number - 1) % max_pages) + 1
 
-                # Номер страницы = cycle_number (зацикливается по max_pages)
-                page_number = cycle_number
-                if page_number > max_pages:
-                    page_number = ((cycle_number - 1) % max_pages) + 1
+            for query in queries:
+                if query in done_queries:
+                    logger.info("Пропуск (уже пройден в этом цикле): %s", query)
+                    continue
+
+                category = self.query_category.get(query, "Без категории")
+                logger.info("─" * 40)
+                logger.info("[%s] Ключевое слово: %s | страница %d",
+                            category, query, page_number)
+                logger.info("─" * 40)
 
                 search_url = self._build_search_url(query, page_number)
-                logger.info("Страница поиска %d", page_number)
 
+                self._network_used = False
                 html = self.get_html(page, search_url)
+                if self._network_used:
+                    self._random_delay()
                 if not html:
                     logger.warning("Поиск не загружен, пропуск")
-                    self._random_delay()
                     continue
 
                 links = self.search_links(html)
-                logger.info("Ссылок найдено: %d", len(links))
+                new_links = [u for u in links if u not in processed]
+                logger.info("Ссылок: %d, новых: %d", len(links), len(new_links))
 
-                for article_url in links:
-                    # ── Предварительная проверка через БД ──
-                    is_dup, existing = (
-                        self.db_manager.check_duplicate_before_download(
-                            article_url
-                        )
-                    )
-                    if is_dup:
-                        logger.info(
-                            "✗ Дубликат по URL в БД, пропуск: %s",
-                            article_url,
-                        )
-                        continue
-
-                    if article_url in seen_urls:
-                        continue
-                    seen_urls.add(article_url)
-
+                for article_url in new_links:
+                    processed.add(article_url)
                     logger.info("Кандидат: %s", article_url)
 
+                    self._network_used = False
                     article = self._process_article(
-                        page, article_url, query, settings
+                        page, article_url, query, category, settings
                     )
 
                     if article:
                         self._articles.append(article)
                         new_this_cycle += 1
                         logger.info(
-                            "✓ Статья #%d. Размер: %.2f MB",
-                            len(self._articles),
+                            "✓ Статья #%d [%s / block_%03d]. Размер: %.2f MB",
+                            len(self._articles), category, article["Блок"],
                             self._total_downloaded_size / (1024 * 1024),
                         )
 
-                    # Случайная задержка между статьями
-                    self._random_delay()
+                    # Задержка только если был реальный запрос к сайту
+                    if self._network_used:
+                        self._random_delay()
 
-                # Случайная задержка между ключевыми словами
-                self._random_delay()
+                # Запрос пройден — запоминаем прогресс
+                done_queries.add(query)
+                self.db_manager.set_state("done_queries", sorted(done_queries))
 
-            # ── Сохранение Excel накопительно каждый цикл ──
-            if self._articles:
-                logger.info("Сохранение Excel (накопительно)...")
-                self.save_excel(
-                    self._articles,
-                    settings["queries"],
-                    settings["start_year"],
-                    settings["end_year"],
-                )
+            # ── Сохранение Excel (из БД: все запуски, не только этот) ──
+            logger.info("Сохранение Excel...")
+            self.save_excel(self.db_manager.get_all_records())
 
             logger.info(
-                "Цикл %d завершён. Новых статей: %d. Всего: %d",
-                cycle_number, new_this_cycle, len(self._articles),
+                "Цикл %d завершён. Новых статей: %d. Всего в БД: %d",
+                cycle_number, new_this_cycle,
+                self.db_manager.get_downloaded_count(),
             )
 
-            # Случайная задержка между циклами
+            # Следующий цикл
+            cycle_number += 1
+            done_queries = set()
+            self.db_manager.set_state("cycle", cycle_number)
+            self.db_manager.set_state("done_queries", [])
             self._random_delay()
 
     def _build_search_url(self, query, page_number):
@@ -470,7 +484,7 @@ class Parser:
             )
         )
 
-    def _process_article(self, page, article_url, query, settings):
+    def _process_article(self, page, article_url, query, category, settings):
         """
         Обработка одной статьи:
         1. Загрузка HTML
@@ -487,6 +501,8 @@ class Parser:
         article_html = self.get_html(page, article_url)
         if not article_html:
             logger.warning("HTML не загружен: %s", article_url)
+            # error не блокирует повторную попытку при следующем запуске
+            self.db_manager.mark_processed(article_url, "error", "no_html")
             return None
 
         soup = BeautifulSoup(article_html, "html.parser")
@@ -508,8 +524,25 @@ class Parser:
             article_year is None
             or not (settings["start_year"] <= article_year <= settings["end_year"])
         ):
-            logger.info("✗ Не подходит по году")
+            logger.info("✗ Не подходит по году (%s, нужно %d–%d)",
+                        article_year, settings["start_year"],
+                        settings["end_year"])
+            self.db_manager.mark_processed(
+                article_url, "rejected", f"year:{article_year}"
+            )
             return None
+
+        # ── 3.1 Пул исключений ──
+        if USE_EXCLUSIONS:
+            excluded = self.check_exclusions(
+                article_title, article_keywords, article_abstract
+            )
+            if excluded:
+                logger.info("✗ Исключена пулом: %s", excluded)
+                self.db_manager.mark_processed(
+                    article_url, "excluded", excluded
+                )
+                return None
 
         # ── 4. Оценка релевантности ──
         article_score, matches = self.score_article(
@@ -526,6 +559,9 @@ class Parser:
 
         if article_score < threshold:
             logger.info("✗ Низкая релевантность (%d < %d)", article_score, threshold)
+            self.db_manager.mark_processed(
+                article_url, "rejected", f"score:{article_score}"
+            )
             return None
 
         # Формируем запись статьи
@@ -537,6 +573,8 @@ class Parser:
             "DOI": article_doi,
             "Релевантность": article_score,
             "Совпадения": matches,
+            "Категория": category,
+            "Блок": 0,
             "Поисковый запрос": query,
             "Ключевые слова": article_keywords,
             "Аннотация": article_abstract,
@@ -551,6 +589,7 @@ class Parser:
             article, settings["filters"], settings["filter_mode"]
         ):
             logger.info("✗ Не прошла дополнительный фильтр")
+            self.db_manager.mark_processed(article_url, "rejected", "filter")
             return None
 
         # ── 6. Проверка дубликата через БД (по URL — ещё раз, на случай гонки) ──
@@ -558,15 +597,18 @@ class Parser:
         if is_dup:
             logger.info("✗ Дубликат по URL в БД, пропуск")
             article["Статус PDF"] = "duplicate"
+            self.db_manager.mark_processed(article_url, "duplicate", "url")
             return None
 
         # ── 7. Скачивание PDF ──
         if settings["download_pdf"]:
             # Ротация блока (10 документов → новый блок)
-            self._check_block_rotation()
+            self._check_block_rotation(category)
+            article["Блок"] = self.spec_manager.get_current_block(category)
 
+            self._network_used = True
             pdf_path, pdf_status, pdf_link = self.download_pdf(
-                page, article_url, article_title, article_year
+                page, article_url, article_title, article_year, category
             )
 
             article["PDF"] = pdf_path
@@ -586,16 +628,26 @@ class Parser:
                     journal=article_journal,
                     keywords=article_keywords,
                     query=query,
+                    category=category,
+                    score=article_score,
+                    matches=matches,
+                    pdf_url=pdf_link,
                 )
                 if is_dup:
                     logger.info("✗ Дубликат по MD5, пропуск")
                     article["Статус PDF"] = "duplicate"
+                    self.db_manager.mark_processed(
+                        article_url, "duplicate", "md5"
+                    )
                     return None
+                self.db_manager.mark_processed(article_url, "downloaded")
             else:
                 logger.warning("PDF не скачан, спецификация не создана")
                 article["Статус PDF"] = "error"
+                self.db_manager.mark_processed(article_url, "error", "pdf")
         else:
             article["Статус PDF"] = "disabled"
+            self.db_manager.mark_processed(article_url, "downloaded", "no_pdf")
 
         return article
 
@@ -603,18 +655,64 @@ class Parser:
     #  Управление блоками директорий
     # ════════════════════════════════════════════════════════════
 
-    def _check_block_rotation(self):
-        """Проверяет, не заполнен ли текущий блок (10 документов)."""
-        if self.spec_manager.maybe_rotate_block():
-            self._block_number = self.spec_manager.current_block
-            logger.info("Новый блок директорий: block_%03d", self._block_number)
+    def _check_block_rotation(self, category):
+        """Проверяет, не заполнен ли текущий блок категории."""
+        if self.spec_manager.maybe_rotate_block(category):
+            logger.info(
+                "[%s] Новый блок: block_%03d",
+                category, self.spec_manager.get_current_block(category),
+            )
 
-    def _get_current_block_dir(self):
-        """Возвращает директорию текущего блока."""
-        return self.spec_manager.get_block_dir(self.spec_manager.current_block)
+    def _get_current_block_dir(self, category):
+        """Директория текущего блока категории."""
+        return self.spec_manager.get_block_dir(
+            category, self.spec_manager.get_current_block(category)
+        )
+
+    # ──────────────────────────────────────────────────────────
+    #  Пул исключений
+    # ──────────────────────────────────────────────────────────
+
+    def _build_exclusion_patterns(self):
+        """Компилирует фразы исключений в регексы (совпадение по началу слов)."""
+        patterns = []
+        for phrase, group in get_all_exclusion_phrases():
+            norm = self.normalize(phrase)
+            if not norm:
+                continue
+            parts = [re.escape(w) for w in norm.split()]
+            regex = re.compile(r"\b" + r"\w*\s+".join(parts))
+            patterns.append((regex, phrase, group))
+        return patterns
+
+    def check_exclusions(self, title, keywords, abstract):
+        """
+        Возвращает строку-причину, если статья попадает под исключения,
+        иначе "".
+
+        Название / ключевые слова: достаточно одной фразы.
+        Аннотация: нужно EXCLUSION_MIN_ABSTRACT_HITS разных фраз
+        (чтобы случайное упоминание не отсекало техническую статью).
+        """
+        head = self.normalize(f"{title} {keywords}")
+        for regex, phrase, group in self.exclusion_patterns:
+            if regex.search(head):
+                return f"{group}: «{phrase}» (название/ключевые слова)"
+
+        body = self.normalize(abstract)
+        hits = [
+            (phrase, group)
+            for regex, phrase, group in self.exclusion_patterns
+            if regex.search(body)
+        ]
+        if len({ph for ph, _ in hits}) >= EXCLUSION_MIN_ABSTRACT_HITS:
+            names = ", ".join(sorted({ph for ph, _ in hits})[:5])
+            return f"{hits[0][1]}: {names} (аннотация)"
+        return ""
 
     def _check_and_save(self, pdf_path, title, authors, abstract,
-                        url, year, doi, journal, keywords, query):
+                        url, year, doi, journal, keywords, query,
+                        category="", score=None, matches="", pdf_url=""):
         """
         Полный цикл сохранения:
         1. Проверка дубликата по MD5 (через spec_manager)
@@ -640,10 +738,19 @@ class Parser:
                 doi=doi,
                 keywords=keywords,
                 abstract=abstract,
-                block_number=self.spec_manager.current_block,
+                block_number=self.spec_manager.get_current_block(category),
                 query_keyword=query,
                 status="duplicate",
+                category=category,
+                score=score,
+                matches=matches,
+                pdf_url=pdf_url,
             )
+            # Копия не нужна — иначе занимает место в блоке
+            try:
+                pdf_path.unlink()
+            except OSError:
+                pass
             return True
 
         # ── 2. Сохранение записи в БД ──
@@ -657,9 +764,13 @@ class Parser:
             doi=doi,
             keywords=keywords,
             abstract=abstract,
-            block_number=self.spec_manager.current_block,
+            block_number=self.spec_manager.get_current_block(category),
             query_keyword=query,
             status="downloaded",
+            category=category,
+            score=score,
+            matches=matches,
+            pdf_url=pdf_url,
         )
 
         # Обновляем суммарный размер
@@ -670,14 +781,16 @@ class Parser:
         # ── 3. Создание спецификации (рядом с PDF, в той же директории) ──
         spec_path = self.spec_manager.create_spec(
             file_path=pdf_path,
+            category=category,
             title=title,
             authors=authors,
             abstract=abstract,
             url=url,
             year=year,
             doi=doi,
+            journal=journal,
             keywords=keywords,
-            block_number=self.spec_manager.current_block,
+            block_number=self.spec_manager.get_current_block(category),
         )
 
         if spec_path:
@@ -692,19 +805,9 @@ class Parser:
     # ════════════════════════════════════════════════════════════
 
     def _stage_save(self, articles, settings):
-        """Сохранение результатов в Excel."""
+        """Сохранение результатов в Excel (все статьи из БД)."""
         logger.info("Этап 5: Сохранение результатов")
-
-        if not articles:
-            logger.info("Подходящих статей нет.")
-            return
-
-        self.save_excel(
-            articles,
-            settings["queries"],
-            settings["start_year"],
-            settings["end_year"],
-        )
+        self.save_excel(self.db_manager.get_all_records())
 
     # ════════════════════════════════════════════════════════════
     #  ЭТАП 6: Статистика
@@ -730,25 +833,14 @@ class Parser:
                 logger.info("  %s: %d файлов, %.2f MB",
                             s["keyword"], s["count"], s["size_mb"])
 
-        # Статистика по блокам
-        block_stats = self.db_manager.get_stats_by_block()
-        if block_stats:
-            logger.info("── По блокам ──")
-            for s in block_stats:
-                logger.info("  block_%03d: %d файлов, %.2f MB",
-                            s["block"], s["count"], s["size_mb"])
-
-        # Статистика из spec_manager
+        # Статистика из spec_manager: категории → блоки
         spec_stats = self.spec_manager.get_stats()
         logger.info("── Файловая система ──")
-        logger.info("Всего PDF: %d", spec_stats["total_docs"])
-        logger.info("Размер: %.2f MB", spec_stats["total_size_mb"])
-        logger.info("Блоков: %d", spec_stats["blocks"])
-        if spec_stats.get("block_numbers"):
-            logger.info(
-                "Номера блоков: %s",
-                ", ".join(f"block_{n:03d}" for n in spec_stats["block_numbers"]),
-            )
+        logger.info("Всего PDF: %d (%.2f MB)",
+                    spec_stats["total_docs"], spec_stats["total_size_mb"])
+        for name, st in spec_stats["categories"].items():
+            logger.info("  %s: %d PDF, блоков %d, %.2f MB",
+                        name, st["docs"], st["blocks"], st["size_mb"])
 
     # ════════════════════════════════════════════════════════════
     #  Утилиты
@@ -813,6 +905,7 @@ class Parser:
             return cached
 
         logger.debug("GET: %s", url)
+        self._network_used = True
 
         try:
             response = page.goto(
@@ -1104,7 +1197,7 @@ class Parser:
         short_hash = hashlib.sha1(article_url.encode("utf-8")).hexdigest()[:8]
         return f"{year} - {title} - {short_hash}.pdf"
 
-    def download_pdf(self, page, article_url, title, year):
+    def download_pdf(self, page, article_url, title, year, category=""):
         """
         Скачивание PDF через браузерный download.
         Сохраняет в директорию текущего блока (рядом со спецификацией).
@@ -1112,7 +1205,7 @@ class Parser:
         pdf_url = article_url.rstrip("/") + "/pdf"
         filename = self.safe_pdf_name(title, year, article_url)
 
-        block_dir = self._get_current_block_dir()
+        block_dir = self._get_current_block_dir(category)
         block_dir.mkdir(parents=True, exist_ok=True)
         path = block_dir / filename
 
@@ -1168,78 +1261,125 @@ class Parser:
         return "", "error", pdf_url
 
     @staticmethod
-    def save_excel(articles, queries, start_year, end_year):
-        """Сохранение результатов в Excel."""
-        if not articles:
+    def _sheet_name(name, used):
+        """Допустимое и уникальное имя листа Excel (≤31 символ)."""
+        base = re.sub(r"[\\/*?:\[\]]", "_", name)[:31] or "Лист"
+        result, i = base, 2
+        while result in used:
+            suffix = f" {i}"
+            result = base[:31 - len(suffix)] + suffix
+            i += 1
+        used.add(result)
+        return result
+
+    @staticmethod
+    def save_excel(records):
+        """
+        Сохраняет Excel: отдельный лист на каждую категорию,
+        внутри листа — блоки (по DOCS_PER_BLOCK статей) с заголовками.
+        records — строки из БД (db_manager.get_all_records()).
+        """
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        if not records:
             return
 
-        df = pd.DataFrame(articles)
-        df = df.drop_duplicates(subset="Ссылка")
+        columns = [
+            ("Блок", "block_number", 8),
+            ("Название", "title", 55),
+            ("Авторы", "authors", 30),
+            ("Год", "year", 8),
+            ("Журнал", "journal", 25),
+            ("DOI", "doi", 25),
+            ("Релевантность", "score", 14),
+            ("Совпадения", "matches", 30),
+            ("Поисковый запрос", "query_keyword", 30),
+            ("Ключевые слова", "keywords", 40),
+            ("Аннотация", "abstract", 70),
+            ("Ссылка", "url", 45),
+            ("PDF URL", "pdf_url", 45),
+            ("PDF", "file_path", 40),
+        ]
 
-        if "DOI" in df.columns:
-            df["_doi"] = df["DOI"].fillna("").astype(str).str.lower().str.strip()
-            with_doi = df[df["_doi"] != ""].drop_duplicates(subset="_doi")
-            without_doi = df[df["_doi"] == ""]
-            df = pd.concat([with_doi, without_doi], ignore_index=True)
-            df = df.drop(columns=["_doi"])
+        by_category = {}
+        for r in records:
+            by_category.setdefault(r.get("category") or "Без категории", []).append(r)
 
-        df = df.sort_values(["Релевантность", "Год"], ascending=[False, False])
-
-        query_name = re.sub(r"[^а-яА-Яa-zA-Z0-9_-]+", "_", "_".join(queries))
-        query_name = query_name[:60]
-        filename = f"cyberleninka_{query_name}_{start_year}_{end_year}.xlsx"
+        filename = "cyberleninka_results.xlsx"
+        block_fill = PatternFill("solid", fgColor="DDEBF7")
+        head_fill = PatternFill("solid", fgColor="BDD7EE")
+        used_names = set()
 
         with pd.ExcelWriter(filename, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Статьи")
-            ws = writer.sheets["Статьи"]
-            ws.freeze_panes = "A2"
-            ws.auto_filter.ref = ws.dimensions
+            # Лист-сводка
+            summary = []
+            for cat, rows in by_category.items():
+                blocks = {r.get("block_number") for r in rows}
+                summary.append({
+                    "Категория": cat,
+                    "Статей": len(rows),
+                    "Блоков": len(blocks),
+                })
+            pd.DataFrame(summary).to_excel(
+                writer, index=False, sheet_name="Сводка"
+            )
+            used_names.add("Сводка")
 
-            widths = {
-                "A": 55, "B": 30, "C": 10, "D": 30, "E": 25,
-                "F": 25, "G": 25, "H": 15, "I": 35, "J": 30,
-                "K": 50, "L": 70, "M": 70, "N": 70, "O": 20,
-            }
-            for column, width in widths.items():
-                ws.column_dimensions[column].width = width
+            for cat, rows in by_category.items():
+                name = Parser._sheet_name(cat, used_names)
+                ws = writer.book.create_sheet(name)
+                writer.sheets[name] = ws
 
-            for row in ws.iter_rows():
-                for cell in row:
-                    cell.alignment = cell.alignment.copy(
-                        wrap_text=True, vertical="top"
+                # Шапка таблицы
+                for col, (title, _, width) in enumerate(columns, start=1):
+                    cell = ws.cell(row=1, column=col, value=title)
+                    cell.font = Font(bold=True)
+                    cell.fill = head_fill
+                    ws.column_dimensions[cell.column_letter].width = width
+                ws.freeze_panes = "A2"
+
+                blocks = {}
+                for r in rows:
+                    blocks.setdefault(r.get("block_number") or 0, []).append(r)
+
+                row_num = 2
+                for block_no in sorted(blocks):
+                    items = sorted(
+                        blocks[block_no],
+                        key=lambda r: (-(r.get("score") or 0), -(r.get("year") or 0)),
                     )
+                    # Строка-заголовок блока
+                    ws.cell(
+                        row=row_num, column=1,
+                        value=f"Блок {block_no:03d} — {len(items)} из {DOCS_PER_BLOCK} статей",
+                    )
+                    for col in range(1, len(columns) + 1):
+                        c = ws.cell(row=row_num, column=col)
+                        c.fill = block_fill
+                        c.font = Font(bold=True)
+                    row_num += 1
 
-            headers = {
-                cell.value: cell.column for cell in ws[1] if cell.value
-            }
+                    for r in items:
+                        for col, (_, key, _) in enumerate(columns, start=1):
+                            value = r.get(key)
+                            if key == "block_number":
+                                value = block_no
+                            cell = ws.cell(row=row_num, column=col, value=value)
+                            cell.alignment = Alignment(
+                                wrap_text=True, vertical="top"
+                            )
+                            if key in ("url", "pdf_url") and value:
+                                cell.hyperlink = value
+                                cell.style = "Hyperlink"
+                            elif key == "file_path" and value:
+                                pdf_path = Path(str(value))
+                                if pdf_path.exists():
+                                    cell.hyperlink = pdf_path.resolve().as_uri()
+                                    cell.style = "Hyperlink"
+                        row_num += 1
+                    row_num += 1  # пустая строка между блоками
 
-            if "Ссылка" in headers:
-                column = headers["Ссылка"]
-                for row_num in range(2, ws.max_row + 1):
-                    cell = ws.cell(row=row_num, column=column)
-                    if cell.value:
-                        cell.hyperlink = cell.value
-                        cell.style = "Hyperlink"
-
-            if "PDF URL" in headers:
-                column = headers["PDF URL"]
-                for row_num in range(2, ws.max_row + 1):
-                    cell = ws.cell(row=row_num, column=column)
-                    if cell.value:
-                        cell.hyperlink = cell.value
-                        cell.style = "Hyperlink"
-
-            if "PDF" in headers:
-                column = headers["PDF"]
-                for row_num in range(2, ws.max_row + 1):
-                    cell = ws.cell(row=row_num, column=column)
-                    if cell.value:
-                        pdf_path = Path(str(cell.value))
-                        if pdf_path.exists():
-                            cell.hyperlink = pdf_path.resolve().as_uri()
-                            cell.style = "Hyperlink"
-
-        logger.info("Excel сохранён: %s", filename)
+        logger.info("Excel сохранён: %s (категорий: %d)", filename, len(by_category))
 
 
 # ──────────────────────────────────────────────────────────────

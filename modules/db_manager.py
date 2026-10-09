@@ -6,7 +6,12 @@
   - Предварительная проверка дубликатов (по URL и MD5) перед скачиванием
   - Учёт суммарного размера скачанных файлов
   - Статистика по базам, блокам, ключевым словам
+  - Запоминание ВСЕХ обработанных URL (в т.ч. отклонённых) — чтобы
+    при перезапуске не обходить их заново
+  - Сохранение прогресса (цикл, пройденные запросы) между запусками
 """
+
+import json
 
 import hashlib
 import logging
@@ -73,10 +78,95 @@ class DatabaseManager:
                 stat_key        TEXT UNIQUE,
                 stat_value      TEXT
             );
+
+            -- Все обработанные статьи (скачанные И отклонённые)
+            CREATE TABLE IF NOT EXISTS processed_urls (
+                url             TEXT PRIMARY KEY,
+                url_hash        TEXT,
+                verdict         TEXT,
+                reason          TEXT,
+                processed_date  TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_proc_hash ON processed_urls(url_hash);
             """
+        )
+        # Миграция: новые колонки в старой БД
+        self._ensure_column("downloaded_files", "category", "TEXT")
+        self._ensure_column("downloaded_files", "score", "INTEGER")
+        self._ensure_column("downloaded_files", "matches", "TEXT")
+        self._ensure_column("downloaded_files", "pdf_url", "TEXT")
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_category "
+            "ON downloaded_files(category)"
         )
         self._conn.commit()
         logger.info("БД инициализирована: %s", self.db_path)
+
+    def _ensure_column(self, table, column, col_type):
+        """Добавляет колонку, если её ещё нет (миграция старой БД)."""
+        cols = {
+            r["name"]
+            for r in self._conn.execute(f"PRAGMA table_info({table})")
+        }
+        if column not in cols:
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {col_type}"
+            )
+
+    # ──────────────────────────────────────────────────────────
+    #  Обработанные URL (скачанные + отклонённые) и прогресс
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def url_hash(url):
+        """Хеш URL (ключ для быстрого поиска)."""
+        return hashlib.sha1(url.encode("utf-8")).hexdigest()
+
+    def mark_processed(self, url, verdict, reason=""):
+        """
+        Запоминает, что URL обработан.
+        verdict: downloaded | rejected | excluded | duplicate | error
+        """
+        self._conn.execute(
+            """INSERT OR REPLACE INTO processed_urls
+               (url, url_hash, verdict, reason, processed_date)
+               VALUES (?, ?, ?, ?, ?)""",
+            (url, self.url_hash(url), verdict, reason,
+             datetime.now().isoformat()),
+        )
+        self._conn.commit()
+
+    def get_processed_urls(self, skip_verdicts=("error",)):
+        """
+        Множество URL, которые не нужно обрабатывать повторно.
+        Ошибки (error) по умолчанию пробуются снова.
+        """
+        rows = self._conn.execute(
+            "SELECT url, verdict FROM processed_urls"
+        ).fetchall()
+        return {r["url"] for r in rows if r["verdict"] not in skip_verdicts}
+
+    def get_state(self, key, default=None):
+        """Читает значение прогресса (JSON)."""
+        row = self._conn.execute(
+            "SELECT stat_value FROM download_stats WHERE stat_key = ?",
+            (key,),
+        ).fetchone()
+        if not row:
+            return default
+        try:
+            return json.loads(row["stat_value"])
+        except (TypeError, ValueError):
+            return default
+
+    def set_state(self, key, value):
+        """Сохраняет значение прогресса (JSON)."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO download_stats (stat_key, stat_value) "
+            "VALUES (?, ?)",
+            (key, json.dumps(value, ensure_ascii=False)),
+        )
+        self._conn.commit()
 
     # ──────────────────────────────────────────────────────────
     #  Предварительная проверка дубликатов (до скачивания)
@@ -141,6 +231,10 @@ class DatabaseManager:
         block_number=None,
         query_keyword="",
         status="downloaded",
+        category="",
+        score=None,
+        matches="",
+        pdf_url="",
     ):
         """
         Сохраняет запись о скачанном файле в БД.
@@ -166,17 +260,22 @@ class DatabaseManager:
                     file_path.name,
                     existing["file_name"] if existing else "unknown",
                 )
+                # md5 = NULL, иначе UNIQUE-конфликт с INSERT OR REPLACE
+                # затёр бы запись оригинала
                 self._conn.execute(
                     """INSERT OR REPLACE INTO downloaded_files
                        (url, md5_hash, title, authors, year, journal, doi,
                         keywords, abstract, file_path, file_size, file_name,
-                        block_number, query_keyword, download_date, status)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        block_number, query_keyword, download_date, status,
+                        category, score, matches, pdf_url)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?)""",
                     (
-                        url, md5_hash, title, authors, year, journal, doi,
+                        url, None, title, authors, year, journal, doi,
                         keywords, abstract, str(file_path), file_size,
                         file_path.name, block_number, query_keyword,
                         datetime.now().isoformat(), "duplicate",
+                        category, score, matches, pdf_url,
                     ),
                 )
                 self._conn.commit()
@@ -188,13 +287,16 @@ class DatabaseManager:
             """INSERT OR REPLACE INTO downloaded_files
                (url, md5_hash, title, authors, year, journal, doi,
                 keywords, abstract, file_path, file_size, file_name,
-                block_number, query_keyword, download_date, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                block_number, query_keyword, download_date, status,
+                category, score, matches, pdf_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?)""",
             (
                 url, md5_hash, title, authors, year, journal, doi,
                 keywords, abstract, str(file_path), file_size,
                 file_path.name, block_number, query_keyword,
                 datetime.now().isoformat(), status,
+                category, score, matches, pdf_url,
             ),
         )
         self._conn.commit()
@@ -300,6 +402,23 @@ class DatabaseManager:
             (block_number,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_all_records(self):
+        """Все успешно скачанные статьи (для сводного Excel)."""
+        rows = self._conn.execute(
+            "SELECT * FROM downloaded_files WHERE status = 'downloaded' "
+            "ORDER BY category, block_number, id"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_category_doc_count(self, category, block_number):
+        """Сколько скачанных статей в блоке категории."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS cnt FROM downloaded_files "
+            "WHERE category = ? AND block_number = ? AND status = 'downloaded'",
+            (category, block_number),
+        ).fetchone()
+        return row["cnt"] if row else 0
 
     def get_known_urls(self):
         """Возвращает множество всех URL, которые уже были обработаны."""

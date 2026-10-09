@@ -143,3 +143,15 @@ def get_keyword_groups():
     Используется для последовательного парсинга по тематикам.
     """
     return sorted(KEYWORD_POOL, key=lambda g: g["priority"])
+
+
+def get_query_category_map():
+    """
+    Возвращает словарь {ключевое слово: категория}.
+    Категория берётся из первой группы, где слово встретилось.
+    """
+    mapping = {}
+    for group in get_keyword_groups():
+        for kw in group["keywords"]:
+            mapping.setdefault(kw, group["category"])
+    return mapping

@@ -93,6 +93,10 @@ _MD_HR_RE = re.compile(r'^(-{3,}|\*{3,}|_{3,})\s*$')
 _MD_BULLET_RE = re.compile(r'^(\s*)([-*])\s+(.*)$')
 _MD_NUMBERED_RE = re.compile(r'^(\s*)(\d+)\.\s+(.*)$')
 
+_PLACEHOLDER_RE = re.compile(r'\{\{.*?\}\}')
+
+_MD_TABLE_SEP_RE = re.compile(r'^\|?\s*[-:]+[-|\s:]*$')
+
 _MD_CODE_FONT = 'Consolas'
 _HYPERLINK_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink'
 _W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -133,6 +137,11 @@ class DocxWorker:
         self.merge_same_style = merge_same_style
         self.preserve_headings = preserve_headings
         self.preserve_list_items = preserve_list_items
+        self._doc = None
+        self._bullet_num_id = None
+        self._decimal_abstract_id = None
+        self._cur_decimal = None
+        self._prev_is_list = False
 
     def _count_words(self, text: str) -> int:
         if not text or not text.strip():
@@ -425,6 +434,7 @@ class DocxWorker:
                     'element_index': idx,
                     'element': element,
                     'is_table': False,
+                    'has_placeholder': bool(_PLACEHOLDER_RE.search(text)),
                 })
         return raw_blocks
 
@@ -437,6 +447,7 @@ class DocxWorker:
             current = raw_blocks[i]
             is_atomic = (
                 current['is_table']
+                or current.get('has_placeholder')
                 or (preserve_headings and current['type'] == 'heading' and current['word_count'] > 0)
                 or (preserve_list_items and current['type'] == 'list_item' and current['word_count'] > 0)
             )
@@ -456,7 +467,7 @@ class DocxWorker:
             j = i + 1
             while merged_words < self.min_words and j < len(raw_blocks):
                 nxt = raw_blocks[j]
-                if nxt['is_table']:
+                if nxt['is_table'] or nxt.get('has_placeholder'):
                     break
                 if preserve_headings and nxt['type'] == 'heading' and nxt['word_count'] > 0:
                     break
@@ -797,6 +808,7 @@ class DocxWorker:
         # should be no jc at all (e.g., "Рапорт" with jc=None).
 
         if not text or not text.strip():
+            self._prev_is_list = False
             return
 
         # --- Blockquote ---
@@ -810,24 +822,27 @@ class DocxWorker:
             self._apply_page_break(p_elem)
             return
 
-        # --- Bullet list ---
-        # FIX v9: Match against text.rstrip() (not stripped) to preserve
-        # leading whitespace for nested list level detection.
+        # --- Bullet / numbered list ---
+        # FIX v13: ids come from numbering definitions we own (they never
+        # clash with the template's numbering.xml); every new numbered list
+        # restarts from 1; alignment is inherited from the paragraph itself.
         line_text = text.rstrip()
         bullet_m = _MD_BULLET_RE.match(line_text)
+        num_m = None if bullet_m else _MD_NUMBERED_RE.match(line_text)
         if bullet_m:
-            indent_str = bullet_m.group(1)
-            level = len(indent_str) // 2
+            level = len(bullet_m.group(1)) // 2
             text = bullet_m.group(3)
-            self._apply_list_style(p_elem, bullet_type='bullet', level=level)
-
-        # --- Numbered list ---
-        num_m = _MD_NUMBERED_RE.match(line_text)
-        if num_m:
-            indent_str = num_m.group(1)
-            level = len(indent_str) // 2
+            self._apply_list_style(p_elem, 'bullet', level, self._bullet_num_id)
+            self._prev_is_list = True
+        elif num_m:
+            level = len(num_m.group(1)) // 2
             text = num_m.group(3)
-            self._apply_list_style(p_elem, bullet_type='number', level=level)
+            if not self._prev_is_list or self._cur_decimal is None:
+                self._cur_decimal = self._new_decimal_num()
+            self._apply_list_style(p_elem, 'number', level, self._cur_decimal)
+            self._prev_is_list = True
+        else:
+            self._prev_is_list = False
 
         for chunk, style in self._parse_markdown_inline(text):
             if chunk == '':
@@ -869,71 +884,93 @@ class DocxWorker:
         pbb.set(qn('w:val'), '1')
 
     @classmethod
-    def _apply_list_style(cls, p_elem, bullet_type: str = 'bullet', level: int = 0) -> None:
-        """FIX v9: Add proper w:numPr with w:ilvl and w:numId so Word renders
-        actual bullet/number markers. Level 0 = top-level, level 1 = nested."""
+    def _apply_list_style(cls, p_elem, bullet_type: str = 'bullet', level: int = 0,
+                          num_id: int = 1) -> None:
         pPr = p_elem.find(qn('w:pPr'))
         if pPr is None:
             pPr = OxmlElement('w:pPr')
             p_elem.insert(0, pPr)
-        # Remove existing w:ind to let numbering definition control indentation
-        ind = pPr.find(qn('w:ind'))
-        if ind is not None:
-            pPr.remove(ind)
-        # Remove existing w:numPr
-        old_numPr = pPr.find(qn('w:numPr'))
-        if old_numPr is not None:
-            pPr.remove(old_numPr)
-        # Add new w:numPr
+        for tag in ('w:ind', 'w:numPr'):
+            el = pPr.find(qn(tag))
+            if el is not None:
+                pPr.remove(el)
         numPr = OxmlElement('w:numPr')
         cls._insert_in_order(pPr, numPr, _PPR_ORDER)
         ilvl = OxmlElement('w:ilvl')
-        ilvl.set(qn('w:val'), str(level))
+        ilvl.set(qn('w:val'), str(min(level, 8)))
         numPr.append(ilvl)
         numId = OxmlElement('w:numId')
-        numId.set(qn('w:val'), '1' if bullet_type == 'bullet' else '2')
+        numId.set(qn('w:val'), str(num_id))
         numPr.append(numId)
+        # jc is NOT touched: the paragraph keeps the alignment of the template
 
     def _ensure_numbering_definitions(self, doc) -> None:
-        """FIX v9: Create numbering.xml part with bullet and numbered list
-        definitions at levels 0 and 1 if it doesn't exist."""
+        """FIX v13: works with or without an existing numbering part. Adds our own
+        abstractNum/num with ids above everything already in the template."""
         from docx.oxml import parse_xml
         from docx.opc.packuri import PackURI
         from docx.opc.constants import RELATIONSHIP_TYPE as RT
         from docx.parts.numbering import NumberingPart
-        # Check if numbering relationship already exists
+        self._doc = doc
         try:
-            doc.part.part_related_by(RT.NUMBERING)
-            return  # Already exists
+            numbering = doc.part.part_related_by(RT.NUMBERING).element
         except KeyError:
-            pass
-        numbering_xml = (
-            f'<w:numbering xmlns:w="{_W_NS}">'
-            '<w:abstractNum w:abstractNumId="0">'
-            '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/>'
-            '<w:lvlText w:val="\u2022"/><w:lvlJc w:val="left"/>'
-            '<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>'
-            '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="bullet"/>'
-            '<w:lvlText w:val="\u25e6"/><w:lvlJc w:val="left"/>'
-            '<w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr></w:lvl>'
-            '</w:abstractNum>'
-            '<w:abstractNum w:abstractNumId="1">'
-            '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>'
-            '<w:lvlText w:val="%1."/><w:lvlJc w:val="left"/>'
-            '<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>'
-            '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/>'
-            '<w:lvlText w:val="%2)"/><w:lvlJc w:val="left"/>'
-            '<w:pPr><w:ind w:left="1440" w:hanging="360"/></w:pPr></w:lvl>'
-            '</w:abstractNum>'
-            '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>'
-            '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>'
-            '</w:numbering>'
-        )
-        element = parse_xml(numbering_xml)
-        partname = PackURI('/word/numbering.xml')
-        content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml'
-        numbering_part = NumberingPart(partname, content_type, element, doc.part.package)
-        doc.part.relate_to(numbering_part, RT.NUMBERING)
+            numbering = parse_xml(f'<w:numbering xmlns:w="{_W_NS}"/>')
+            part = NumberingPart(PackURI('/word/numbering.xml'),
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml',
+                numbering, doc.part.package)
+            doc.part.relate_to(part, RT.NUMBERING)
+        self._numbering = numbering
+        ab_ids = [int(e.get(qn('w:abstractNumId'))) for e in numbering.findall(qn('w:abstractNum'))]
+        n_ids = [int(e.get(qn('w:numId'))) for e in numbering.findall(qn('w:num'))]
+        bullet_ab = max(ab_ids + [-1]) + 1
+        decimal_ab = bullet_ab + 1
+        self._next_num_id = max(n_ids + [0]) + 1
+
+        def lvl(i, fmt, text, left, font=None):
+            rpr = (f'<w:rPr><w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:hint="default"/></w:rPr>'
+                   if font else '')
+            return (f'<w:lvl w:ilvl="{i}"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/>'
+                    f'<w:lvlText w:val="{text}"/><w:lvlJc w:val="left"/>'
+                    f'<w:pPr><w:ind w:left="{left}" w:hanging="360"/></w:pPr>{rpr}</w:lvl>')
+
+        bullets = [('\u2022', None), ('\u2013', None), ('\u2022', None)]
+        bullet_lvls = ''.join(lvl(i, 'bullet', bullets[i % 3][0], 720 + 720 * i) for i in range(9))
+        dec_fmt = [('decimal', '%1.'), ('lowerLetter', '%2)'), ('lowerRoman', '%3.')]
+        dec_lvls = ''.join(
+            lvl(i, dec_fmt[i % 3][0], f'%{i + 1}' + (')' if i % 3 == 1 else '.'), 720 + 720 * i)
+            for i in range(9))
+        ab_b = parse_xml(f'<w:abstractNum xmlns:w="{_W_NS}" w:abstractNumId="{bullet_ab}">'
+                         f'<w:multiLevelType w:val="hybridMultilevel"/>{bullet_lvls}</w:abstractNum>')
+        ab_d = parse_xml(f'<w:abstractNum xmlns:w="{_W_NS}" w:abstractNumId="{decimal_ab}">'
+                         f'<w:multiLevelType w:val="hybridMultilevel"/>{dec_lvls}</w:abstractNum>')
+        # schema order: all abstractNum first, then num
+        first_num = numbering.find(qn('w:num'))
+        for ab in (ab_b, ab_d):
+            if first_num is not None:
+                first_num.addprevious(ab)
+            else:
+                numbering.append(ab)
+        self._decimal_abstract_id = decimal_ab
+        self._bullet_num_id = self._add_num(bullet_ab)
+
+    def _add_num(self, abstract_id: int, restart: bool = False) -> int:
+        from docx.oxml import parse_xml
+        num_id = self._next_num_id
+        self._next_num_id += 1
+        override = ''
+        if restart:
+            override = ''.join(
+                f'<w:lvlOverride w:ilvl="{i}"><w:startOverride w:val="1"/></w:lvlOverride>'
+                for i in range(9))
+        num = parse_xml(f'<w:num xmlns:w="{_W_NS}" w:numId="{num_id}">'
+                        f'<w:abstractNumId w:val="{abstract_id}"/>{override}</w:num>')
+        self._numbering.append(num)
+        return num_id
+
+    def _new_decimal_num(self) -> int:
+        """Fresh w:num -> every numbered list starts again from 1."""
+        return self._add_num(self._decimal_abstract_id, restart=True)
 
     @classmethod
     def _apply_heading_style(cls, p_elem, level: int) -> None:
@@ -1010,6 +1047,173 @@ class DocxWorker:
             alloc[i] += 1
         return alloc
 
+
+    # ------------------------------------------------------------------
+    # Markdown table support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_table_start(lines: List[str], idx: int) -> bool:
+        """Check if lines starting at idx form a Markdown table (header + separator)."""
+        if idx + 1 >= len(lines):
+            return False
+        header = lines[idx].strip()
+        separator = lines[idx + 1].strip()
+        if '|' not in header:
+            return False
+        if not _MD_TABLE_SEP_RE.match(separator):
+            return False
+        if '|' not in separator:
+            return False
+        return True
+
+    @staticmethod
+    def _parse_table_row(line: str) -> List[str]:
+        """Parse a Markdown table row into cell values."""
+        line = line.strip()
+        if line.startswith('|'):
+            line = line[1:]
+        if line.endswith('|'):
+            line = line[:-1]
+        return [cell.strip() for cell in line.split('|')]
+
+    @staticmethod
+    def _parse_table_alignment(separator: str) -> List[str]:
+        """Parse column alignments from a Markdown table separator row."""
+        separator = separator.strip()
+        if separator.startswith('|'):
+            separator = separator[1:]
+        if separator.endswith('|'):
+            separator = separator[:-1]
+        cols = separator.split('|')
+        alignments = []
+        for col in cols:
+            col = col.strip()
+            left = col.startswith(':')
+            right = col.endswith(':')
+            if left and right:
+                alignments.append('center')
+            elif right:
+                alignments.append('right')
+            else:
+                alignments.append('left')
+        return alignments
+
+    @staticmethod
+    def _split_text_by_tables(text: str) -> List[Dict[str, Any]]:
+        """Split text into segments, some of which are Markdown tables."""
+        lines = text.split('\n')
+        segments: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(lines):
+            if DocxWorker._is_table_start(lines, i):
+                # Collect table lines
+                table_lines = [lines[i], lines[i + 1]]
+                alignments = DocxWorker._parse_table_alignment(lines[i + 1])
+                j = i + 2
+                while j < len(lines) and '|' in lines[j].strip() and lines[j].strip():
+                    table_lines.append(lines[j])
+                    j += 1
+                segments.append({
+                    'type': 'table',
+                    'lines': table_lines,
+                    'header': DocxWorker._parse_table_row(table_lines[0]),
+                    'rows': [DocxWorker._parse_table_row(l) for l in table_lines[2:]],
+                    'alignments': alignments,
+                })
+                i = j
+            else:
+                text_lines: List[str] = []
+                while i < len(lines):
+                    if DocxWorker._is_table_start(lines, i):
+                        break
+                    text_lines.append(lines[i])
+                    i += 1
+                segments.append({
+                    'type': 'text',
+                    'lines': text_lines,
+                })
+        return segments
+
+    def _create_table_element(self, header: List[str], rows: List[List[str]],
+                              alignments: List[str], nsmap) -> Any:
+        """Create a w:tbl element from parsed Markdown table data."""
+        tbl = OxmlElement('w:tbl')
+
+        # --- Table properties ---
+        tblPr = OxmlElement('w:tblPr')
+        tblW = OxmlElement('w:tblW')
+        tblW.set(qn('w:w'), '5000')   # v13: full text width (was auto -> narrow table, wrapped words)
+        tblW.set(qn('w:type'), 'pct')
+        tblPr.append(tblW)
+
+        # Borders
+        tblBorders = OxmlElement('w:tblBorders')
+        for border_name in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV'):
+            border = OxmlElement(f'w:{border_name}')
+            border.set(qn('w:val'), 'single')
+            border.set(qn('w:sz'), '4')
+            border.set(qn('w:space'), '0')
+            border.set(qn('w:color'), 'auto')
+            tblBorders.append(border)
+        tblPr.append(tblBorders)
+        tbl.append(tblPr)
+
+        # --- Table grid ---
+        num_cols = max(len(header), max((len(r) for r in rows), default=0))
+        tblGrid = OxmlElement('w:tblGrid')
+        for _ in range(num_cols):
+            gridCol = OxmlElement('w:gridCol')
+            tblGrid.append(gridCol)
+        tbl.append(tblGrid)
+
+        def _make_cell(text: str, col_idx: int, bold: bool = False) -> Any:
+            tc = OxmlElement('w:tc')
+            tcPr = OxmlElement('w:tcPr')
+            tc.append(tcPr)
+            p = OxmlElement('w:p')
+            pPr = OxmlElement('w:pPr')
+            p.append(pPr)
+            # Alignment
+            if col_idx < len(alignments):
+                align = alignments[col_idx]
+                jc = OxmlElement('w:jc')
+                jc.set(qn('w:val'), align)
+                self._insert_in_order(pPr, jc, _PPR_ORDER)
+            for chunk, style in self._parse_markdown_inline(text):
+                if chunk == '':
+                    continue
+                run = self._make_run(chunk, style, None)
+                if bold and not style.get('bold'):
+                    rPr = run.find(qn('w:rPr'))
+                    if rPr is not None:
+                        self._set_run_bool_prop(rPr, 'w:b', True)
+                p.append(run)
+            tc.append(p)
+            return tc
+
+        # --- Header row ---
+        tr = OxmlElement('w:tr')
+        trPr = OxmlElement('w:trPr')
+        tblHeader = OxmlElement('w:tblHeader')
+        tblHeader.set(qn('w:val'), 'true')
+        trPr.append(tblHeader)
+        tr.append(trPr)
+        for col_idx in range(num_cols):
+            cell_text = header[col_idx] if col_idx < len(header) else ''
+            tr.append(_make_cell(cell_text, col_idx, bold=True))
+        tbl.append(tr)
+
+        # --- Data rows ---
+        for row_data in rows:
+            tr = OxmlElement('w:tr')
+            for col_idx in range(num_cols):
+                cell_text = row_data[col_idx] if col_idx < len(row_data) else ''
+                tr.append(_make_cell(cell_text, col_idx, bold=False))
+            tbl.append(tr)
+
+        return tbl
+
     def _process_block(self, block: Dict[str, Any],
                        text_processor: Callable[[str, Dict[str, Any]], str],
                        nsmap) -> None:
@@ -1028,28 +1232,75 @@ class DocxWorker:
         if new_text is None:
             new_text = block['text']
 
+        if new_text == block['text']:
+            return  # nothing changed: keep original runs, numbering, alignment
+
         new_text = new_text.replace('\r\n', '\n').replace('\r', '\n')
         new_text = new_text.replace('\\n', '\n')
 
-        lines = new_text.split('\n')
-        alloc = self._distribute_lines(lines, word_counts)
+        self._prev_is_list = False
+        self._cur_decimal = None
 
-        pos = 0
-        for elem, n in zip(elements, alloc):
-            my_lines = lines[pos:pos + n]
-            pos += n
+        # --- Check for Markdown tables in the new text ---
+        segments = self._split_text_by_tables(new_text)
+        has_tables = any(seg['type'] == 'table' for seg in segments)
 
-            template = deepcopy(elem)
-            self._strip_unwanted_pPr_elements(template)
+        if not has_tables:
+            # Original behaviour: no tables, distribute lines across paragraphs
+            lines = new_text.split('\n')
+            alloc = self._distribute_lines(lines, word_counts)
 
-            self._apply_markdown_to_paragraph(elem, my_lines[0] if my_lines else '', nsmap)
-            anchor = elem
-            for line in (my_lines[1:] if my_lines else []):
-                new_p = deepcopy(template)
-                self._strip_unwanted_pPr_elements(new_p)
-                self._apply_markdown_to_paragraph(new_p, line, nsmap)
-                anchor.addnext(new_p)
-                anchor = new_p
+            pos = 0
+            for elem, n in zip(elements, alloc):
+                my_lines = lines[pos:pos + n]
+                pos += n
+
+                template = deepcopy(elem)
+                self._strip_unwanted_pPr_elements(template)
+
+                self._apply_markdown_to_paragraph(elem, my_lines[0] if my_lines else '', nsmap)
+                anchor = elem
+                for line in (my_lines[1:] if my_lines else []):
+                    new_p = deepcopy(template)
+                    self._strip_unwanted_pPr_elements(new_p)
+                    self._apply_markdown_to_paragraph(new_p, line, nsmap)
+                    anchor.addnext(new_p)
+                    anchor = new_p
+            return
+
+        # --- Table-aware path: process segments in order, inserting tables ---
+        elem_idx = 0
+        last_anchor = None
+        first_template = deepcopy(elements[0]) if elements else None
+        if first_template is not None:
+            self._strip_unwanted_pPr_elements(first_template)
+
+        for seg in segments:
+            if seg['type'] == 'table':
+                tbl = self._create_table_element(
+                    seg['header'], seg['rows'], seg['alignments'], nsmap
+                )
+                if last_anchor is not None:
+                    last_anchor.addnext(tbl)
+                    last_anchor = tbl
+                elif elem_idx < len(elements):
+                    elements[elem_idx].addprevious(tbl)
+                    last_anchor = tbl
+            else:
+                for line in seg['lines']:
+                    if elem_idx < len(elements):
+                        elem = elements[elem_idx]
+                        elem_idx += 1
+                        template = deepcopy(elem)
+                        self._strip_unwanted_pPr_elements(template)
+                        self._apply_markdown_to_paragraph(elem, line, nsmap)
+                        last_anchor = elem
+                    elif first_template is not None:
+                        new_p = deepcopy(first_template)
+                        self._strip_unwanted_pPr_elements(new_p)
+                        self._apply_markdown_to_paragraph(new_p, line, nsmap)
+                        last_anchor.addnext(new_p)
+                        last_anchor = new_p
 
     def process_document(self, input_path: str, output_path: str,
                          text_processor: Callable[[str, Dict[str, Any]], str],
@@ -1212,6 +1463,12 @@ TAG_DESCR = {
         '- Подготовил отчёт о готовности личного состава к несению службы\n'
         '\n'
         'В ходе выполнения задач были достигнуты следующие результаты:\n'
+        '\n'
+        '| Показатель | План | Факт | Выполнение |\n'
+        '|:------------|:----:|-----:|:-----------|\n'
+        '| Инвентаризация | 100% | 100% | Выполнено |\n'
+        '| Боевая подготовка | 40 ч | 42 ч | Перевыполнено |\n'
+        '| Готовность состава | 95% | 98% | Перевыполнено |\n'
         '\n'
         '1. Все материальные ценности учтены и внесены в реестр\n'
         '  1. проверены по наименованию\n'
