@@ -378,6 +378,9 @@ class Parser:
         # ── Восстановление прогресса прошлого запуска ──
         cycle_number = self.db_manager.get_state("cycle", 0) or 1
         done_queries = set(self.db_manager.get_state("done_queries", []))
+        # Следующая страница поиска для каждого запроса (без ограничения
+        # глубины: страницы идут 1, 2, 3, ... пока у сайта есть результаты)
+        query_pages = self.db_manager.get_state("query_pages", {}) or {}
         if cycle_number > 1 or done_queries:
             logger.info(
                 "Возобновление: цикл %d, уже пройдено запросов: %d",
@@ -403,54 +406,16 @@ class Parser:
                         len(processed))
             logger.info("=" * 50)
 
-            page_number = ((cycle_number - 1) % max_pages) + 1
-
             for query in queries:
                 if query in done_queries:
                     logger.info("Пропуск (уже пройден в этом цикле): %s", query)
                     continue
 
                 category = self.query_category.get(query, "Без категории")
-                logger.info("─" * 40)
-                logger.info("[%s] Ключевое слово: %s | страница %d",
-                            category, query, page_number)
-                logger.info("─" * 40)
-
-                search_url = self._build_search_url(query, page_number)
-
-                self._network_used = False
-                html = self.get_html(page, search_url)
-                if self._network_used:
-                    self._random_delay()
-                if not html:
-                    logger.warning("Поиск не загружен, пропуск")
-                    continue
-
-                links = self.search_links(html)
-                new_links = [u for u in links if u not in processed]
-                logger.info("Ссылок: %d, новых: %d", len(links), len(new_links))
-
-                for article_url in new_links:
-                    processed.add(article_url)
-                    logger.info("Кандидат: %s", article_url)
-
-                    self._network_used = False
-                    article = self._process_article(
-                        page, article_url, query, category, settings
-                    )
-
-                    if article:
-                        self._articles.append(article)
-                        new_this_cycle += 1
-                        logger.info(
-                            "✓ Статья #%d [%s / block_%03d]. Размер: %.2f MB",
-                            len(self._articles), category, article["Блок"],
-                            self._total_downloaded_size / (1024 * 1024),
-                        )
-
-                    # Задержка только если был реальный запрос к сайту
-                    if self._network_used:
-                        self._random_delay()
+                new_this_cycle += self._process_query(
+                    page, query, category, settings, processed, query_pages,
+                    max_pages,
+                )
 
                 # Запрос пройден — запоминаем прогресс
                 done_queries.add(query)
@@ -472,6 +437,84 @@ class Parser:
             self.db_manager.set_state("cycle", cycle_number)
             self.db_manager.set_state("done_queries", [])
             self._random_delay()
+
+    def _process_query(self, page, query, category, settings, processed,
+                       query_pages, max_pages):
+        """
+        Один заход по запросу: продолжает с сохранённой страницы поиска.
+
+        Страницы, где все ссылки уже обработаны, пролистываются сразу
+        (до max_pages за заход), чтобы быстро дойти до новых статей.
+        Когда результаты заканчиваются — запрос начинается с 1-й страницы
+        (там могли появиться новые публикации).
+        Возвращает число новых статей.
+        """
+        new_count = 0
+        page_number = int(query_pages.get(query, 1))
+        prev_links = None
+
+        for _ in range(max(1, max_pages)):
+            logger.info("─" * 40)
+            logger.info("[%s] Ключевое слово: %s | страница %d",
+                        category, query, page_number)
+            logger.info("─" * 40)
+
+            search_url = self._build_search_url(query, page_number)
+
+            self._network_used = False
+            html = self.get_html(page, search_url)
+            if self._network_used:
+                self._random_delay()
+            if not html:
+                logger.warning("Поиск не загружен, пропуск")
+                break
+
+            links = self.search_links(html)
+            # Пустая страница или повтор предыдущей — результаты закончились
+            if not links or links == prev_links:
+                logger.info("Результаты по «%s» закончились на странице %d, "
+                            "следующий заход — с 1-й страницы",
+                            query, page_number)
+                page_number = 1
+                break
+            prev_links = links
+
+            new_links = [u for u in links if u not in processed]
+            logger.info("Ссылок: %d, новых: %d", len(links), len(new_links))
+
+            for article_url in new_links:
+                processed.add(article_url)
+                logger.info("Кандидат: %s", article_url)
+
+                self._network_used = False
+                article = self._process_article(
+                    page, article_url, query, category, settings
+                )
+
+                if article:
+                    self._articles.append(article)
+                    new_count += 1
+                    logger.info(
+                        "✓ Статья #%d [%s / block_%03d]. Размер: %.2f MB",
+                        len(self._articles), category, article["Блок"],
+                        self._total_downloaded_size / (1024 * 1024),
+                    )
+
+                # Задержка только если был реальный запрос к сайту
+                if self._network_used:
+                    self._random_delay()
+
+            page_number += 1
+            query_pages[query] = page_number
+            self.db_manager.set_state("query_pages", query_pages)
+
+            # Страница дала работу — переходим к следующему запросу
+            if new_links:
+                break
+
+        query_pages[query] = page_number
+        self.db_manager.set_state("query_pages", query_pages)
+        return new_count
 
     def _build_search_url(self, query, page_number):
         """Формирует URL поиска по спецификации сайта."""
